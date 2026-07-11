@@ -6,19 +6,56 @@ Multi-agent workflows for [Claude Code](https://claude.com/claude-code)'s Workfl
 
 Implements a requirement end-to-end with a deliberate quality loop:
 
-```
-Builder ──► Reviewer panel ◄──► Fixer ──► PR creator
- (1×)        (per round)      (per round)    (1×)
-                  │
-                  └── any DB schema change pauses the run
-                      for a HUMAN to apply it — agents
-                      never touch a database
+```mermaid
+flowchart TD
+    A["Launch — args:<br/>requirement · repoPath · baseBranch …"] --> B
+    B["<b>BUILDER</b> · session model · runs once<br/>study repo → feature branch → implement + tests → commit<br/>(writes migration files, never runs them)"]
+    B --> C{"unapproved DB<br/>schema change?"}
+    C -- "yes" --> P["⏸ PAUSE — awaiting_db_approval<br/>HUMAN reviews and applies the migrations,<br/>then resumes with resumeFromRunId + approvedDbChanges<br/>(completed agents replay from cache)"]
+    P --> D
+    C -- "no" --> D
+    subgraph reviewloop ["review ⇄ fix loop"]
+        D["<b>REVIEW PANEL</b> — 3 agents in parallel<br/>correctness: opus·high · safety/DB: sonnet·high · quality: sonnet·medium<br/>each independently reads git diff base…branch"]
+        D --> E{"blocker / major<br/>issues?"}
+        E -- "yes" --> F{"rounds left under<br/>maxReviewRounds?"}
+        F -- "yes" --> G["<b>FIXER</b> · sonnet·high<br/>fix each issue or justify skip → commit"]
+        G --> H{"new DB<br/>schema change?"}
+        H -- "no — last round's issues + fixer's claims feed the next review" --> D
+    end
+    H -- "yes" --> P
+    F -- "no" --> X["status: review_not_satisfied<br/>(no PR — unresolved issues returned)"]
+    E -- "no — reviewer satisfied" --> I["<b>PR CREATOR</b> · haiku·low<br/>push branch → gh pr create<br/>body lists DB changes to apply manually"]
+    I --> Z["status: pr_created / pr_failed"]
 ```
 
 1. **Builder** studies the repo, implements the requirement on a feature branch, runs tests, commits. It never pushes and never applies database migrations.
 2. **Reviewer panel** — three parallel lenses review the diff each round: correctness/requirement-fit, security + DB safety, and code quality. Issues are rated `blocker` / `major` / `minor` / `nit`.
 3. **Fixer** addresses every blocking issue (or justifies a skip — the panel judges the justification next round). The loop repeats until the panel reports **zero blocking issues**, capped by `maxReviewRounds`.
 4. **PR creator** pushes the branch and opens the GitHub PR via `gh`, including a "Database schema changes (apply manually)" section when relevant.
+
+### Architecture
+
+```mermaid
+flowchart TD
+    S["<b>CLAUDE CODE SESSION</b> — you + the main agent<br/>launches the workflow · surfaces pauses · resumes with approvedDbChanges"]
+    O["<b>ORCHESTRATOR SCRIPT</b> — deterministic JavaScript, no LLM<br/>owns control flow: review⇄fix loop, round cap, DB gate, typed statuses<br/>couriers context: each agent's structured output → next agent's prompt<br/>journals every result → resume cache"]
+    S --> O
+    O --> B1["<b>BUILDER</b><br/>session model · 1×"]
+    O --> R1["<b>REVIEW PANEL</b><br/>opus + sonnet ×2 · per round"]
+    O --> F1["<b>FIXER</b><br/>sonnet · per round"]
+    O --> P1["<b>PR CREATOR</b><br/>haiku · 1×"]
+    GIT["<b>GIT FEATURE BRANCH</b> — the shared whiteboard<br/>agents have no shared transcripts; each re-reads the real code from here"]
+    B1 -- "commits" --> GIT
+    R1 -- "reads diff" --> GIT
+    F1 -- "commits" --> GIT
+    P1 -- "push + gh pr create" --> GH["<b>GITHUB</b><br/>PR · issues"]
+    HUMAN["<b>HUMAN GATE</b>"]
+    DB[("<b>DATABASE</b><br/>agents write migration files only")]
+    O -. "pause on unapproved schema change" .-> HUMAN
+    HUMAN -- "reviews and applies migrations" --> DB
+```
+
+Three properties worth noting: all determinism lives in the **script layer** — an LLM never decides whether to loop again; the **agents are stateless workers** whose only outbound channels are their structured output and commits to the branch; and there are exactly **two escape hatches to the outside world** — the human gate in front of the database, and the PR creator in front of GitHub. Everything else is local and reversible.
 
 ### Install
 
